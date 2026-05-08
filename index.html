@@ -1,0 +1,598 @@
+import React, { useState, useEffect } from 'react';
+import { MapPin, Search, ShoppingCart, CheckCircle2, AlertTriangle, ChevronRight, FileText, Bot, Store, Map, Receipt, Mic, Loader } from 'lucide-react';
+
+// --- CONFIGURACIÓN Y CONSTANTES ---
+const MAX_DISTANCE_KM = 15;
+const FORBIDDEN_STORES = ['Costco', 'Sam\'s Club'];
+const ALLOWED_STORES = ['Walmart', 'Soriana', 'Chedraui', 'Bodega Aurrerá'];
+
+// Lista de ejemplo por defecto
+const DEFAULT_LIST = `Leche | Lala Deslactosada | 3
+Arroz | Verde Valle | 2
+Huevos blancos 18pz | San Juan | 1
+Papel Higiénico 12 rollos | Pétalo | 1
+Atún en agua | Dolores | 4
+Pan de caja | Bimbo Blanco | 1`;
+
+export default function AhorroBotApp() {
+  const [step, setStep] = useState(1);
+  
+  // Estado de Fase 1: Geografía
+  const [zipCode, setZipCode] = useState('');
+  const [stores, setStores] = useState([]);
+  const [isSearchingLoc, setIsSearchingLoc] = useState(false);
+  const [locationError, setLocationError] = useState('');
+
+  // Estado de Fase 2: Lista
+  const [listInput, setListInput] = useState(''); // Se inicia vacío
+  const [parsedItems, setParsedItems] = useState([]);
+  const [isListening, setIsListening] = useState(false);
+  const [isStructuring, setIsStructuring] = useState(false);
+  const [voiceError, setVoiceError] = useState('');
+
+  // Estado de Fase 3 y 4: Resultados
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processingMsg, setProcessingMsg] = useState('');
+  const [results, setResults] = useState(null);
+
+  // --- LOGICA FASE 1: FILTRO GEOGRÁFICO ---
+  const handleSearchLocation = () => {
+    if (zipCode.length < 4) {
+      setLocationError('Por favor ingresa un Código Postal válido.');
+      return;
+    }
+    setLocationError('');
+    setIsSearchingLoc(true);
+
+    // Simulación de búsqueda de tiendas geolocalizadas
+    setTimeout(() => {
+      // Generamos una lista aleatoria de tiendas para este CP
+      const foundStores = ALLOWED_STORES.map(store => {
+        // Distancia aleatoria entre 1 y 25 km
+        const distance = +(Math.random() * 24 + 1).toFixed(1);
+        return { name: store, distance };
+      });
+
+      // Aplicar GUARDRAILS: Filtrar > 15km y ordenar por cercanía
+      const validStores = foundStores
+        .filter(s => s.distance <= MAX_DISTANCE_KM)
+        .sort((a, b) => a.distance - b.distance);
+
+      setStores(validStores);
+      setIsSearchingLoc(false);
+      
+      if (validStores.length > 0) {
+        setStep(2);
+      } else {
+        setLocationError(`No se encontraron tiendas en un radio de ${MAX_DISTANCE_KM}km de tu ubicación. ¡El realismo logístico es vital!`);
+      }
+    }, 1500);
+  };
+
+  // --- LOGICA FASE 2: EXTRACCIÓN DE DATOS ---
+  const handleProcessList = () => {
+    if (!listInput.trim()) return;
+    
+    // Extracción inteligente simulada
+    const lines = listInput.split('\n').filter(l => l.trim() !== '');
+    const items = lines.map(line => {
+      // Soporta separadores de barra | o comas
+      const parts = line.split(/[|,]/);
+      return {
+        product: parts[0]?.trim() || 'Desconocido',
+        brand: parts[1]?.trim() || 'Sin Especificar',
+        qty: parseInt(parts[2]) || 1
+      };
+    }).filter(item => item.product !== 'Desconocido');
+
+    setParsedItems(items);
+    setStep(3);
+    startPriceSimulation(items);
+  };
+
+  const structureDictation = async (text) => {
+    setIsStructuring(true);
+    const apiKey = ""; // API Key proveída por el entorno
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+    const payload = {
+      contents: [{ parts: [{ text: text }] }],
+      systemInstruction: { parts: [{ text: "Eres AhorroBot. Extrae artículos de compras del texto dictado. Devuelve ÚNICAMENTE la lista en este formato exacto por línea: Producto | Marca | Cantidad. Si no hay marca, usa 'Sin Especificar'. Si la cantidad no es clara, usa 1. Ejemplo: Leche | Lala | 2. Si mencionan varios, pon uno por línea." }] }
+    };
+
+    let retries = 5;
+    let delay = 1000;
+    let success = false;
+    let generatedText = "";
+
+    // Protocolo de reintentos con retroceso exponencial
+    while(retries > 0 && !success) {
+       try {
+          const response = await fetch(url, {
+             method: 'POST',
+             headers: { 'Content-Type': 'application/json' },
+             body: JSON.stringify(payload)
+          });
+          if (!response.ok) throw new Error("API Error");
+          const data = await response.json();
+          generatedText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+          success = true;
+       } catch (err) {
+          retries--;
+          await new Promise(res => setTimeout(res, delay));
+          delay *= 2;
+       }
+    }
+
+    if (success && generatedText) {
+       // Añadimos el texto estructurado al final de lo que ya estaba escrito
+       setListInput(prev => prev + (prev.trim() ? '\n' : '') + generatedText.trim());
+    } else {
+       // Fallback en caso de que la red falle
+       setListInput(prev => prev + (prev.trim() ? '\n' : '') + text + " | Sin Especificar | 1");
+       setVoiceError('No se pudo estructurar con IA. Texto crudo añadido.');
+    }
+    setIsStructuring(false);
+  };
+
+  const toggleListening = () => {
+    setVoiceError('');
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    
+    if (!SpeechRecognition) {
+      setVoiceError('Tu navegador no soporta dictado por voz.');
+      return;
+    }
+
+    if (isListening) return;
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'es-MX';
+    recognition.continuous = true; // Escucha continua para permitir pausas
+    recognition.interimResults = true;
+
+    let timeoutId = null;
+    let finalTranscript = '';
+
+    recognition.onstart = () => setIsListening(true);
+    
+    recognition.onend = () => {
+      setIsListening(false);
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+    
+    recognition.onerror = (event) => {
+      setIsListening(false);
+      setVoiceError('Error al escuchar: ' + event.error);
+    };
+
+    recognition.onresult = (event) => {
+      finalTranscript = '';
+      for (let i = 0; i < event.results.length; i++) {
+        finalTranscript += event.results[i][0].transcript;
+      }
+
+      // Reinicia el temporizador en cada pausa corta
+      if (timeoutId) clearTimeout(timeoutId);
+
+      // Espera 1.5 segundos de silencio antes de detenerse y procesar
+      timeoutId = setTimeout(() => {
+        recognition.stop();
+        if (finalTranscript.trim()) {
+          structureDictation(finalTranscript);
+        }
+      }, 1500);
+    };
+
+    recognition.start();
+  };
+
+  // --- LOGICA FASE 3: BÚSQUEDA GEOLOCALIZADA ---
+  const startPriceSimulation = (items) => {
+    setIsProcessing(true);
+    
+    const messages = [
+      "Consultando precios en tiempo real...",
+      "Aplicando filtros de fidelidad de marca...",
+      "Verificando inventarios en tiendas locales...",
+      "Calculando subtotales por cantidad..."
+    ];
+    
+    let msgIndex = 0;
+    setProcessingMsg(messages[0]);
+    
+    const interval = setInterval(() => {
+      msgIndex++;
+      if (msgIndex < messages.length) {
+        setProcessingMsg(messages[msgIndex]);
+      }
+    }, 1000);
+
+    setTimeout(() => {
+      clearInterval(interval);
+      generateResults(items);
+    }, 4500);
+  };
+
+  const generateResults = (items) => {
+    const tableData = [];
+    const totals = {};
+    stores.forEach(s => totals[s.name] = 0);
+
+    items.forEach(item => {
+      // Precio base simulado basado en longitud del nombre
+      const basePrice = (item.product.length + item.brand.length) * 3 + 15;
+      
+      const itemRow = { ...item, prices: {} };
+      
+      stores.forEach(store => {
+        // 15% de probabilidad de que no haya stock (Gestión de Stock Guardrail)
+        const isOutOfStock = Math.random() > 0.85;
+        
+        if (isOutOfStock) {
+          itemRow.prices[store.name] = null; // null = No encontrado
+        } else {
+          // Variación de precio por tienda (+/- 10%)
+          const variance = (Math.random() * 0.2) - 0.1;
+          let finalPrice = basePrice * (1 + variance);
+          
+          // Walmart y Bodega suelen ser más baratos en este simulador
+          if (store.name === 'Bodega Aurrerá') finalPrice *= 0.9;
+          if (store.name === 'Walmart') finalPrice *= 0.95;
+
+          const unitPrice = +(finalPrice).toFixed(2);
+          const subTotal = unitPrice * item.qty;
+          
+          itemRow.prices[store.name] = { unit: unitPrice, subTotal: subTotal };
+          totals[store.name] += subTotal;
+        }
+      });
+      tableData.push(itemRow);
+    });
+
+    // Determinar ganador (el que tenga el total menor mayor a 0, asumiendo que encontró todo)
+    // Para simplificar: penalizamos a la tienda por productos no encontrados sumando un valor alto
+    let winner = null;
+    let minTotal = Infinity;
+
+    stores.forEach(store => {
+      let missingItems = tableData.filter(row => row.prices[store.name] === null).length;
+      let effectiveTotal = totals[store.name];
+      
+      // Si le faltan productos, no puede ser el ganador fácilmente
+      if (missingItems === 0 && effectiveTotal < minTotal && effectiveTotal > 0) {
+        minTotal = effectiveTotal;
+        winner = store;
+      }
+    });
+
+    // Si todas tienen faltantes, gana la que tenga menor costo de lo encontrado (aproximación)
+    if (!winner) {
+      let bestFallback = null;
+      let bestFallbackTotal = Infinity;
+      stores.forEach(store => {
+        if (totals[store.name] > 0 && totals[store.name] < bestFallbackTotal) {
+          bestFallbackTotal = totals[store.name];
+          bestFallback = store;
+        }
+      });
+      winner = bestFallback;
+    }
+
+    setResults({
+      table: tableData,
+      totals: totals,
+      winner: winner
+    });
+    
+    setIsProcessing(false);
+    setStep(4);
+  };
+
+  const restart = () => {
+    setStep(1);
+    setStores([]);
+    setResults(null);
+  };
+
+  // --- COMPONENTES UI ---
+  return (
+    <div className="min-h-screen bg-[#fcfaf7] font-sans text-stone-800">
+      {/* Header */}
+      <header className="bg-white border-b border-stone-200 sticky top-0 z-50">
+        <div className="max-w-5xl mx-auto px-6 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 bg-[#d4a373] rounded-xl flex items-center justify-center text-white shadow-sm">
+              <Bot size={24} />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold tracking-tight leading-none">AhorroBot</h1>
+              <p className="text-[10px] uppercase tracking-widest text-stone-400 font-semibold mt-1">Inteligencia Minorista</p>
+            </div>
+          </div>
+          <button onClick={restart} className="text-sm font-medium text-stone-500 hover:text-[#d4a373] transition-colors">
+            Reiniciar
+          </button>
+        </div>
+      </header>
+
+      <main className="max-w-5xl mx-auto px-6 py-8">
+        
+        {/* Progress Tracker */}
+        <div className="flex items-center justify-between mb-12 max-w-2xl mx-auto relative">
+          <div className="absolute left-0 top-1/2 -translate-y-1/2 w-full h-1 bg-stone-200 -z-10"></div>
+          <div className="absolute left-0 top-1/2 -translate-y-1/2 h-1 bg-[#d4a373] -z-10 transition-all duration-500" 
+               style={{ width: `${((step - 1) / 3) * 100}%` }}></div>
+          
+          {[
+            { id: 1, icon: Map, label: "Ubicación" },
+            { id: 2, icon: FileText, label: "Lista" },
+            { id: 3, icon: Search, label: "Búsqueda" },
+            { id: 4, icon: Receipt, label: "Resultados" }
+          ].map((s) => (
+            <div key={s.id} className="flex flex-col items-center gap-2">
+              <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-sm transition-colors border-2
+                ${step >= s.id ? 'bg-[#d4a373] border-[#d4a373] text-white' : 'bg-white border-stone-300 text-stone-400'}`}>
+                {step > s.id ? <CheckCircle2 size={20} /> : <s.icon size={18} />}
+              </div>
+              <span className={`text-xs font-semibold ${step >= s.id ? 'text-stone-800' : 'text-stone-400'}`}>{s.label}</span>
+            </div>
+          ))}
+        </div>
+
+        <div className="max-w-3xl mx-auto">
+          
+          {/* PASO 1: Ubicación */}
+          {step === 1 && (
+            <div className="bg-white p-8 rounded-3xl shadow-sm border border-stone-200 animate-in fade-in slide-in-from-bottom-4">
+              <h2 className="text-2xl font-bold mb-2">Fase 1: Cobertura Logística</h2>
+              <p className="text-stone-500 mb-8">Ingresa tu Código Postal. Validaremos las sucursales de supermercados disponibles en un radio estricto de 15 km.</p>
+              
+              <div className="flex gap-4">
+                <div className="relative flex-1">
+                  <MapPin className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-400" size={20} />
+                  <input 
+                    type="text" 
+                    placeholder="Ej. 06700" 
+                    value={zipCode}
+                    onChange={(e) => setZipCode(e.target.value.replace(/[^0-9]/g, ''))}
+                    maxLength={5}
+                    className="w-full pl-12 pr-4 py-4 bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#d4a373]/50 focus:border-[#d4a373] transition-all font-medium text-lg"
+                  />
+                </div>
+                <button 
+                  onClick={handleSearchLocation}
+                  disabled={isSearchingLoc}
+                  className="px-8 py-4 bg-[#2d2d2d] text-white rounded-xl font-bold hover:bg-black transition-colors flex items-center gap-2 disabled:opacity-70"
+                >
+                  {isSearchingLoc ? 'Rastreando...' : 'Verificar Radio'}
+                  {!isSearchingLoc && <ChevronRight size={20} />}
+                </button>
+              </div>
+              {locationError && (
+                <div className="mt-4 p-4 bg-red-50 text-red-700 rounded-xl flex items-center gap-3 text-sm font-medium border border-red-100">
+                  <AlertTriangle size={18} />
+                  {locationError}
+                </div>
+              )}
+
+              <div className="mt-8 pt-6 border-t border-stone-100">
+                <h4 className="text-xs uppercase font-bold text-stone-400 mb-3 tracking-widest">Guardrails Activos</h4>
+                <div className="flex gap-4">
+                  <span className="px-3 py-1.5 bg-stone-100 text-stone-600 text-xs rounded-full font-medium">Límite: 15 km</span>
+                  <span className="px-3 py-1.5 bg-red-50 text-red-600 text-xs rounded-full font-medium line-through decoration-red-400">Clubes de Membresía</span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* PASO 2: Lista de Compras */}
+          {step === 2 && (
+            <div className="bg-white p-8 rounded-3xl shadow-sm border border-stone-200 animate-in fade-in slide-in-from-bottom-4">
+              <div className="flex items-start justify-between mb-6">
+                <div>
+                  <h2 className="text-2xl font-bold mb-2">Fase 2: Extracción de Datos</h2>
+                  <p className="text-stone-500">Ingresa tu lista. El formato óptimo es: <span className="font-mono bg-stone-100 px-2 py-0.5 rounded text-sm text-[#d4a373]">Producto | Marca | Cantidad</span></p>
+                </div>
+                <div className="bg-green-50 text-green-700 px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 border border-green-200">
+                  <CheckCircle2 size={16} />
+                  {stores.length} tiendas viables halladas
+                </div>
+              </div>
+
+              <div className="mb-4 flex gap-2 flex-wrap">
+                {stores.map((s, i) => (
+                  <span key={i} className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-stone-50 border border-stone-200 text-stone-600 text-xs rounded-full font-medium">
+                    <Store size={12} className="text-[#d4a373]"/>
+                    {s.name} ({s.distance}km)
+                  </span>
+                ))}
+              </div>
+
+              {voiceError && (
+                <div className="mb-4 p-3 bg-red-50 text-red-700 rounded-xl flex items-center gap-2 text-xs font-medium border border-red-100 animate-in fade-in">
+                  <AlertTriangle size={14} />
+                  {voiceError}
+                </div>
+              )}
+
+              <div className="flex flex-col mb-6">
+                <div className="flex justify-between items-center bg-stone-100 p-3 rounded-t-xl border border-stone-200 border-b-0">
+                  <span className="text-xs font-bold text-stone-500 uppercase tracking-widest pl-2">Ingreso de Datos</span>
+                  <button 
+                    onClick={toggleListening}
+                    disabled={isStructuring || isListening}
+                    className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-all ${
+                      isListening 
+                        ? 'bg-red-100 text-red-600 animate-pulse' 
+                        : isStructuring 
+                          ? 'bg-[#d4a373]/20 text-[#d4a373]' 
+                          : 'bg-white text-stone-600 hover:bg-[#d4a373] hover:text-white border border-stone-200 shadow-sm'
+                    }`}
+                  >
+                    {isListening ? (
+                      <><Mic size={16} className="animate-bounce" /> Escuchando...</>
+                    ) : isStructuring ? (
+                      <><Loader size={16} className="animate-spin" /> Procesando IA...</>
+                    ) : (
+                      <><Mic size={16} /> Dictar Lista</>
+                    )}
+                  </button>
+                </div>
+                <textarea 
+                  rows={8}
+                  value={listInput}
+                  onChange={(e) => setListInput(e.target.value)}
+                  className="w-full p-4 bg-white border border-stone-200 rounded-b-xl focus:outline-none focus:ring-2 focus:ring-[#d4a373]/50 transition-all font-mono text-sm leading-relaxed"
+                  placeholder="Ejemplo de formato:&#10;Leche | Lala | 2&#10;Arroz | Verde Valle | 1&#10;&#10;Puedes escribir aquí manualmente o usar el botón de 'Dictar Lista' para que AhorroBot lo estructure por ti."
+                ></textarea>
+              </div>
+
+              <button 
+                onClick={handleProcessList}
+                className="w-full py-4 bg-[#2d2d2d] text-white rounded-xl font-bold hover:bg-black transition-colors flex items-center justify-center gap-2"
+              >
+                <ShoppingCart size={20} />
+                Procesar Carrito y Cotizar
+              </button>
+            </div>
+          )}
+
+          {/* PASO 3: Procesamiento */}
+          {step === 3 && (
+            <div className="bg-white p-12 rounded-3xl shadow-sm border border-stone-200 text-center animate-in fade-in zoom-in-95">
+              <div className="w-20 h-20 border-4 border-stone-100 border-t-[#d4a373] rounded-full animate-spin mx-auto mb-8"></div>
+              <h2 className="text-2xl font-bold mb-4">Ejecutando Inteligencia de Mercado</h2>
+              <p className="text-stone-500 max-w-md mx-auto text-lg h-8 animate-pulse">
+                {processingMsg}
+              </p>
+              
+              <div className="mt-12 bg-stone-50 p-6 rounded-2xl max-w-sm mx-auto text-left border border-stone-100">
+                <p className="text-xs font-bold text-stone-400 uppercase tracking-widest mb-3">Progreso de Tareas</p>
+                <ul className="space-y-3 text-sm text-stone-600 font-medium">
+                  <li className="flex items-center gap-2 text-green-600"><CheckCircle2 size={16} /> Extracción de {parsedItems.length} artículos</li>
+                  <li className="flex items-center gap-2 text-green-600"><CheckCircle2 size={16} /> Conexión con {stores.length} sucursales locales</li>
+                  <li className="flex items-center gap-2 text-[#d4a373] animate-pulse"><Search size={16} /> Comparando fidelidad de marcas...</li>
+                </ul>
+              </div>
+            </div>
+          )}
+
+          {/* PASO 4: Resultados */}
+          {step === 4 && results && (
+            <div className="animate-in fade-in slide-in-from-bottom-4 space-y-6">
+              
+              {/* Tarjeta de Veredicto */}
+              <div className="bg-[#2d2d2d] text-white p-8 rounded-3xl shadow-lg relative overflow-hidden">
+                <div className="relative z-10">
+                  <h2 className="text-xs font-bold text-[#d4a373] uppercase tracking-widest mb-2">Veredicto AhorroBot</h2>
+                  <h3 className="text-3xl font-bold mb-2">
+                    {results.winner ? `Tu mejor opción es ${results.winner.name}` : 'Resultados Mixtos'}
+                  </h3>
+                  <p className="text-stone-400 mb-6 flex items-center gap-2">
+                    <MapPin size={16} />
+                    {results.winner ? `A solo ${results.winner.distance} km de tu ubicación` : 'Consulta la tabla para detalles'}
+                  </p>
+                  
+                  {results.winner && (
+                    <div className="inline-block bg-white text-stone-900 px-6 py-3 rounded-xl font-bold text-xl">
+                      Costo Total: ${results.totals[results.winner.name].toFixed(2)}
+                    </div>
+                  )}
+                </div>
+                {/* Elemento Decorativo */}
+                <div className="absolute right-0 top-0 w-64 h-64 bg-[#d4a373] rounded-full mix-blend-overlay opacity-20 filter blur-3xl -translate-y-1/2 translate-x-1/4"></div>
+              </div>
+
+              {/* Tabla Comparativa */}
+              <div className="bg-white rounded-3xl shadow-sm border border-stone-200 overflow-hidden">
+                <div className="p-6 border-b border-stone-100 bg-stone-50 flex items-center justify-between">
+                  <h3 className="font-bold text-lg">Desglose Geolocalizado</h3>
+                  <span className="text-xs font-medium text-stone-500 bg-white px-3 py-1 rounded-full border border-stone-200 shadow-sm">
+                    CP: {zipCode} • Radio &lt; 15km
+                  </span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse min-w-[600px]">
+                    <thead>
+                      <tr className="border-b border-stone-200">
+                        <th className="p-4 text-xs font-bold text-stone-400 uppercase tracking-wider bg-stone-50/50">Producto</th>
+                        <th className="p-4 text-xs font-bold text-stone-400 uppercase tracking-wider bg-stone-50/50">Marca & Cant.</th>
+                        {stores.map(store => (
+                          <th key={store.name} className={`p-4 text-xs font-bold uppercase tracking-wider ${results.winner?.name === store.name ? 'text-[#d4a373] bg-[#fdf8f4]' : 'text-stone-600'}`}>
+                            {store.name}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="text-sm">
+                      {results.table.map((row, idx) => (
+                        <tr key={idx} className="border-b border-stone-100 hover:bg-stone-50/50 transition-colors">
+                          <td className="p-4 font-semibold text-stone-800">{row.product}</td>
+                          <td className="p-4 text-stone-500">
+                            <span className="block text-xs font-bold text-stone-900">{row.brand}</span>
+                            <span className="text-xs">x{row.qty}</span>
+                          </td>
+                          {stores.map(store => {
+                            const priceData = row.prices[store.name];
+                            return (
+                              <td key={store.name} className={`p-4 ${results.winner?.name === store.name ? 'bg-[#fdf8f4]' : ''}`}>
+                                {priceData ? (
+                                  <div>
+                                    <span className="block font-bold">${priceData.subTotal.toFixed(2)}</span>
+                                    <span className="text-[10px] text-stone-400">${priceData.unit.toFixed(2)} c/u</span>
+                                  </div>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-red-50 text-red-600 text-[10px] font-bold rounded">
+                                    <AlertTriangle size={10} /> Agotado
+                                  </span>
+                                )}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                      {/* Fila de Totales */}
+                      <tr className="bg-stone-50 border-t-2 border-stone-200">
+                        <td colSpan="2" className="p-4 text-right font-bold uppercase text-xs tracking-wider text-stone-500">
+                          Costo Total Estimado
+                        </td>
+                        {stores.map(store => (
+                          <td key={store.name} className={`p-4 font-bold text-lg ${results.winner?.name === store.name ? 'text-[#d4a373] bg-[#fdf8f4]' : 'text-stone-800'}`}>
+                            ${results.totals[store.name].toFixed(2)}
+                          </td>
+                        ))}
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="flex gap-4 mt-6">
+                <button 
+                  onClick={() => {
+                    setStep(2);
+                    setResults(null);
+                  }}
+                  className="flex-1 py-4 bg-[#d4a373] text-white rounded-xl font-bold hover:bg-[#c29161] transition-colors flex items-center justify-center gap-2"
+                >
+                  <ShoppingCart size={20} />
+                  Añadir Más Artículos
+                </button>
+                <button 
+                  onClick={restart}
+                  className="flex-1 py-4 bg-white border border-stone-200 text-stone-600 rounded-xl font-bold hover:bg-stone-50 transition-colors flex items-center justify-center gap-2"
+                >
+                  <MapPin size={20} />
+                  Nueva Búsqueda (Cambiar CP)
+                </button>
+              </div>
+
+            </div>
+          )}
+
+        </div>
+      </main>
+    </div>
+  );
+}
