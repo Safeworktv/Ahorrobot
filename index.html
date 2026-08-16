@@ -1,166 +1,459 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { 
-  MapPin, Search, ShoppingCart, CheckCircle2, AlertTriangle, 
-  ChevronRight, FileText, Bot, Store, Map, Receipt, Mic, Loader 
+import React, { useCallback, useState } from 'react';
+import {
+  AlertTriangle,
+  Bot,
+  CheckCircle2,
+  Loader,
+  MapPin,
+  ShoppingCart,
+  Store
 } from 'lucide-react';
 
-/**
- * CONFIGURACIÓN DE GRADO INDUSTRIAL - AHORROBOT 2026
+/*
+ * Producción usa exclusivamente endpoints propios. GEMINI_API_KEY y cualquier
+ * otra credencial deben permanecer en el servidor, nunca en este archivo.
  */
-const CONFIG = {
-  MAX_DISTANCE_KM: 15,
-  FORBIDDEN_STORES: ['Costco', 'Sam\'s Club'],
-  ALLOWED_STORES: ['Walmart', 'Soriana', 'Chedraui', 'Bodega Aurrerá'],
-  API_MODEL: "gemini-3-flash", // Estándar Mayo 2026
-  RETRY_LIMIT: 3
+const BUILD_ENV = import.meta.env || {};
+const RUNTIME_CONFIG =
+  typeof window !== 'undefined' ? window.__AHORROBOT_CONFIG__ || {} : {};
+const REQUESTED_MODE = String(
+  RUNTIME_CONFIG.mode || BUILD_ENV.VITE_APP_MODE || 'production'
+).toLowerCase();
+
+const CONFIG = Object.freeze({
+  MODE: REQUESTED_MODE === 'demo' ? 'demo' : 'production',
+  API_BASE_URL: String(
+    RUNTIME_CONFIG.apiBaseUrl || BUILD_ENV.VITE_API_BASE_URL || ''
+  ).replace(/\/$/, ''),
+  RADIUS_KM: 15,
+  REQUEST_TIMEOUT_MS: 15000,
+  ALLOWED_CHAINS: ['Walmart', 'Soriana', 'Chedraui', 'Bodega Aurrerá'],
+  EXCLUDED_CHAINS: ['Costco', 'Sam\'s Club']
+});
+
+const POSTAL_CODE_PATTERN = /^\d{5}$/;
+
+async function postJson(path, body) {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    CONFIG.REQUEST_TIMEOUT_MS
+  );
+
+  try {
+    const response = await fetch(CONFIG.API_BASE_URL + path, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(
+        data.message || 'El servicio respondió con estado ' + response.status + '.'
+      );
+    }
+    return data;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('La solicitud excedió el tiempo máximo de espera.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function wait(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function hashText(text) {
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+/* Generador determinista usado sólo por demoDataSource. */
+function seededRandom(seedText) {
+  let seed = hashText(seedText);
+  return () => {
+    seed += 0x6d2b79f5;
+    let value = seed;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function slug(text) {
+  return String(text)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+function normalizeStores(rawStores) {
+  if (!Array.isArray(rawStores)) {
+    throw new Error('La respuesta de sucursales es inválida.');
+  }
+
+  const stores = rawStores
+    .map((raw, index) => {
+      const chain = String(raw.chain || raw.name || '').trim();
+      const branch = String(raw.branch || raw.branchName || '').trim();
+      const distanceKm = Number(raw.distanceKm ?? raw.distance);
+      return {
+        id: String(
+          raw.id || raw.branchId || slug(chain + '-' + branch) + '-' + index
+        ),
+        chain,
+        branch,
+        name: branch ? chain + ' · ' + branch : chain,
+        distanceKm
+      };
+    })
+    .filter(store =>
+      store.id &&
+      CONFIG.ALLOWED_CHAINS.includes(store.chain) &&
+      Number.isFinite(store.distanceKm) &&
+      store.distanceKm >= 0 &&
+      store.distanceKm <= CONFIG.RADIUS_KM
+    )
+    .sort((left, right) => left.distanceKm - right.distanceKm);
+
+  const unique = Array.from(
+    new Map(stores.map(store => [store.id, store])).values()
+  );
+  if (!unique.length) {
+    throw new Error('No hay sucursales elegibles dentro del radio configurado.');
+  }
+  return unique;
+}
+
+function normalizeItems(rawItems) {
+  if (!Array.isArray(rawItems)) {
+    throw new Error('La respuesta de artículos es inválida.');
+  }
+
+  const items = rawItems
+    .slice(0, 100)
+    .map((raw, index) => {
+      const product = String(raw.product || '').trim();
+      const brand = String(raw.brand || 'Sin especificar').trim();
+      const presentation = String(
+        raw.presentation || raw.size || 'Sin especificar'
+      ).trim();
+      const quantity = Number.parseInt(raw.quantity ?? raw.qty ?? 1, 10);
+      if (!product || !Number.isInteger(quantity) || quantity < 1 || quantity > 999) {
+        return null;
+      }
+      return {
+        id: String(
+          raw.id ||
+            slug(product + '-' + brand + '-' + presentation) + '-' + index
+        ),
+        product,
+        brand: brand || 'Sin especificar',
+        presentation: presentation || 'Sin especificar',
+        quantity
+      };
+    })
+    .filter(Boolean);
+
+  if (!items.length) {
+    throw new Error('Agrega al menos un artículo válido.');
+  }
+  return items;
+}
+
+function parseList(text) {
+  return normalizeItems(
+    String(text)
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean)
+      .map(line => {
+        const parts = line.split('|').map(part => part.trim());
+        return {
+          product: parts[0],
+          brand: parts[1] || 'Sin especificar',
+          quantity: parts[2] || 1,
+          presentation: parts[3] || 'Sin especificar'
+        };
+      })
+  );
+}
+
+function formatList(items) {
+  return items
+    .map(item =>
+      [item.product, item.brand, item.quantity, item.presentation].join(' | ')
+    )
+    .join('\n');
+}
+
+function buildComparison(items, stores, payload) {
+  if (!Array.isArray(payload.offers)) {
+    throw new Error('La respuesta de precios no contiene ofertas válidas.');
+  }
+
+  const itemIds = new Set(items.map(item => item.id));
+  const storeIds = new Set(stores.map(store => store.id));
+  const offerMap = new Map();
+
+  payload.offers.forEach(raw => {
+    const itemId = String(raw.itemId || '');
+    const storeId = String(raw.storeId || '');
+    if (!itemIds.has(itemId) || !storeIds.has(storeId)) return;
+
+    const item = items.find(value => value.id === itemId);
+    const unitPrice = Number(raw.unitPrice ?? raw.unit);
+    const inStock = raw.inStock !== false && Number.isFinite(unitPrice);
+    const subtotal = Number(
+      raw.subtotal ?? raw.subTotal ?? unitPrice * item.quantity
+    );
+    offerMap.set(itemId + '::' + storeId, {
+      inStock,
+      unitPrice: inStock ? unitPrice : null,
+      subtotal: inStock && Number.isFinite(subtotal) ? subtotal : null,
+      capturedAt: raw.capturedAt || payload.quotedAt || null,
+      sourceUrl: raw.sourceUrl || null
+    });
+  });
+
+  const table = items.map(item => {
+    const prices = {};
+    stores.forEach(store => {
+      prices[store.id] = offerMap.get(item.id + '::' + store.id) || null;
+    });
+    return { ...item, prices };
+  });
+
+  const summaries = stores.map(store => {
+    const availableOffers = table
+      .map(row => row.prices[store.id])
+      .filter(offer => offer && offer.inStock && Number.isFinite(offer.subtotal));
+    return {
+      store,
+      availableItems: availableOffers.length,
+      complete: availableOffers.length === items.length,
+      total: availableOffers.reduce((sum, offer) => sum + offer.subtotal, 0)
+    };
+  });
+
+  const winnerSummary = summaries
+    .filter(summary => summary.complete && summary.total > 0)
+    .sort((left, right) => left.total - right.total)[0];
+
+  return {
+    table,
+    summaries,
+    totals: Object.fromEntries(
+      summaries.map(summary => [summary.store.id, summary.total])
+    ),
+    winner: winnerSummary ? winnerSummary.store : null,
+    source: payload.source || CONFIG.MODE,
+    quotedAt: payload.quotedAt || null
+  };
+}
+
+const demoDataSource = {
+  async findStores(postalCode) {
+    await wait(400);
+    const random = seededRandom('stores:' + postalCode);
+    const rawStores = CONFIG.ALLOWED_CHAINS.map(chain => {
+      const branch = 1 + Math.floor(random() * 4);
+      return {
+        id: 'demo-' + slug(chain) + '-' + branch,
+        chain,
+        branch: 'Sucursal demo ' + branch,
+        distanceKm: Number((0.8 + random() * 18).toFixed(1))
+      };
+    });
+    return normalizeStores(rawStores);
+  },
+
+  async structureItems(text) {
+    await wait(250);
+    const value = String(text);
+    const lineText =
+      value.includes('|') || value.includes('\n')
+        ? value
+        : value.split(/[,;]/).join('\n');
+    return parseList(lineText);
+  },
+
+  async comparePrices({ postalCode, stores, items }) {
+    await wait(700);
+    const offers = [];
+    items.forEach(item => {
+      stores.forEach(store => {
+        const random = seededRandom(
+          ['prices', postalCode, item.id, store.id].join(':')
+        );
+        const inStock = random() > 0.08;
+        const base = 12 + (item.product.length + item.brand.length) * 2.35;
+        const chainFactor = 0.9 + (hashText(store.chain) % 17) / 100;
+        const unitPrice = Number(
+          (base * chainFactor * (0.96 + random() * 0.08)).toFixed(2)
+        );
+        offers.push({
+          itemId: item.id,
+          storeId: store.id,
+          inStock,
+          unitPrice: inStock ? unitPrice : null,
+          subtotal: inStock
+            ? Number((unitPrice * item.quantity).toFixed(2))
+            : null
+        });
+      });
+    });
+    return { offers, source: 'demo', quotedAt: new Date().toISOString() };
+  }
 };
+
+const productionDataSource = {
+  async findStores(postalCode) {
+    const data = await postJson('/api/stores/nearby', {
+      postalCode,
+      radiusKm: CONFIG.RADIUS_KM,
+      allowedChains: CONFIG.ALLOWED_CHAINS,
+      excludedChains: CONFIG.EXCLUDED_CHAINS
+    });
+    return normalizeStores(data.stores);
+  },
+
+  async structureItems(text) {
+    const data = await postJson('/api/items/structure', {
+      text,
+      locale: 'es-MX'
+    });
+    return normalizeItems(data.items);
+  },
+
+  async comparePrices({ postalCode, stores, items }) {
+    return postJson('/api/prices/compare', {
+      postalCode,
+      storeIds: stores.map(store => store.id),
+      items
+    });
+  }
+};
+
+const DATA_SOURCE =
+  CONFIG.MODE === 'demo' ? demoDataSource : productionDataSource;
+
+function errorMessage(error, fallback) {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
 
 export default function AhorroBotApp() {
   const [step, setStep] = useState(1);
-  
-  // FASE 1: Geografía
-  const [zipCode, setZipCode] = useState('');
+  const [postalCode, setPostalCode] = useState('');
   const [stores, setStores] = useState([]);
-  const [isSearchingLoc, setIsSearchingLoc] = useState(false);
   const [locationError, setLocationError] = useState('');
-
-  // FASE 2: Lista
-  const [listInput, setListInput] = useState('');
-  const [parsedItems, setParsedItems] = useState([]);
-  const [isListening, setIsListening] = useState(false);
+  const [isFindingStores, setIsFindingStores] = useState(false);
+  const [listText, setListText] = useState('');
+  const [items, setItems] = useState([]);
+  const [listError, setListError] = useState('');
   const [isStructuring, setIsStructuring] = useState(false);
-  const [voiceError, setVoiceError] = useState('');
-
-  // FASE 3 y 4: Procesamiento y Resultados
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [processingMsg, setProcessingMsg] = useState('');
+  const [processingMessage, setProcessingMessage] = useState('');
   const [results, setResults] = useState(null);
 
-  /**
-   * Lógica de Validación Geográfica
-   * Calcula disponibilidad de sucursales basándose en el radio de $15\text{ km}$.
-   */
-  const handleSearchLocation = useCallback(() => {
-    if (zipCode.length < 5) {
-      setLocationError('El Código Postal debe contener 5 dígitos.');
+  const findStores = useCallback(async () => {
+    if (!POSTAL_CODE_PATTERN.test(postalCode)) {
+      setLocationError('El código postal debe contener exactamente 5 dígitos.');
       return;
     }
+
     setLocationError('');
-    setIsSearchingLoc(true);
-
-    setTimeout(() => {
-      const foundStores = CONFIG.ALLOWED_STORES.map(store => ({
-        name: store,
-        distance: +(Math.random() * 20 + 0.5).toFixed(1)
-      }));
-
-      const validStores = foundStores
-        .filter(s => s.distance <= CONFIG.MAX_DISTANCE_KM)
-        .sort((a, b) => a.distance - b.distance);
-
-      setStores(validStores);
-      setIsSearchingLoc(false);
-      
-      if (validStores.length > 0) {
-        setStep(2);
-      } else {
-        setLocationError(`Error 404-LOC: No hay sucursales viables en un radio de ${CONFIG.MAX_DISTANCE_KM}km.`);
-      }
-    }, 1200);
-  }, [zipCode]);
-
-  /**
-   * Integración de IA para Estructuración de Datos
-   * Transforma lenguaje natural en esquemas Producto | Marca | Cantidad.
-   */
-  const structureDictation = async (text) => {
-    setIsStructuring(true);
-    const apiKey = "YOUR_API_KEY_HERE"; 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.API_MODEL}:generateContent?key=${apiKey}`;
-
-    const payload = {
-      contents: [{ parts: [{ text: text }] }],
-      systemInstruction: { 
-        parts: [{ text: "Extrae artículos de compras. Formato: Producto | Marca | Cantidad. Si no hay marca, usa 'Genérico'. Cantidad default: 1." }] 
-      }
-    };
-
+    setIsFindingStores(true);
     try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      const data = await response.json();
-      const generatedText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      
-      if (generatedText) {
-        setListInput(prev => prev + (prev.trim() ? '\n' : '') + generatedText.trim());
-      }
-    } catch (err) {
-      setVoiceError('Fallo en sincronización con LLM. Usando modo offline.');
-      setListInput(prev => prev + (prev.trim() ? '\n' : '') + `${text} | Genérico | 1`);
+      setStores(await DATA_SOURCE.findStores(postalCode));
+      setStep(2);
+    } catch (error) {
+      setStores([]);
+      setLocationError(
+        errorMessage(error, 'No fue posible validar las sucursales.')
+      );
+    } finally {
+      setIsFindingStores(false);
+    }
+  }, [postalCode]);
+
+  const structureList = async () => {
+    if (!listText.trim()) {
+      setListError('Escribe o pega primero una lista de compras.');
+      return;
+    }
+
+    setListError('');
+    setIsStructuring(true);
+    try {
+      setListText(formatList(await DATA_SOURCE.structureItems(listText)));
+    } catch (error) {
+      setListError(
+        errorMessage(error, 'No fue posible estructurar la lista.')
+      );
     } finally {
       setIsStructuring(false);
     }
   };
 
-  /**
-   * Motor de Simulación de Precios
-   * Utiliza varianza $V$ para determinar el costo total $C_T$:
-   * $$C_T = \sum_{i=1}^{n} (P_{base, i} \times (1 \pm V) \times Q_i)$$
-   */
-  const startPriceSimulation = (items) => {
-    setIsProcessing(true);
-    const logs = [
-      "Sincronizando con base de datos minorista...",
-      "Calculando varianza de precios regionales...",
-      "Verificando existencias en anaquel...",
-      "Generando reporte comparativo..."
-    ];
-    
-    let i = 0;
-    const interval = setInterval(() => {
-      setProcessingMsg(logs[i] || "Finalizando...");
-      i++;
-    }, 800);
+  const compare = async () => {
+    setListError('');
+    let parsedItems;
+    try {
+      parsedItems = parseList(listText);
+    } catch (error) {
+      setListError(errorMessage(error, 'Revisa el formato de la lista.'));
+      return;
+    }
 
-    setTimeout(() => {
-      clearInterval(interval);
-      const tableData = items.map(item => {
-        const base = (item.product.length + item.brand.length) * 2.5 + 10;
-        const storePrices = {};
-        
-        stores.forEach(s => {
-          const outOfStock = Math.random() > 0.92;
-          if (outOfStock) {
-            storePrices[s.name] = null;
-          } else {
-            const variance = (Math.random() * 0.16) - 0.08;
-            const unit = +(base * (1 + variance)).toFixed(2);
-            storePrices[s.name] = { unit, subTotal: unit * item.qty };
-          }
-        });
-        return { ...item, prices: storePrices };
+    setItems(parsedItems);
+    setProcessingMessage(
+      CONFIG.MODE === 'demo'
+        ? 'Generando comparación demostrativa...'
+        : 'Consultando precios y existencias verificables...'
+    );
+    setStep(3);
+
+    try {
+      const payload = await DATA_SOURCE.comparePrices({
+        postalCode,
+        stores,
+        items: parsedItems
       });
-
-      const totals = {};
-      stores.forEach(s => {
-        totals[s.name] = tableData.reduce((acc, row) => acc + (row.prices[s.name]?.subTotal || 0), 0);
-      });
-
-      const winner = stores.reduce((prev, curr) => (totals[prev.name] < totals[curr.name] ? prev : curr));
-
-      setResults({ table: tableData, totals, winner });
+      setResults(buildComparison(parsedItems, stores, payload));
       setStep(4);
-      setIsProcessing(false);
-    }, 3500);
+    } catch (error) {
+      setListError(
+        errorMessage(error, 'No fue posible completar la comparación.')
+      );
+      setStep(2);
+    }
   };
 
   const restart = () => {
     setStep(1);
-    setZipCode('');
+    setPostalCode('');
+    setStores([]);
+    setListText('');
+    setItems([]);
+    setLocationError('');
+    setListError('');
     setResults(null);
+    setProcessingMessage('');
   };
 
   return (
@@ -172,144 +465,354 @@ export default function AhorroBotApp() {
               <Bot size={24} />
             </div>
             <div>
-              <h1 className="font-bold text-lg leading-none">AhorroBot <span className="text-stone-400 font-normal">v2.0</span></h1>
-              <span className="text-[10px] text-stone-500 uppercase tracking-tighter">Motor de Optimización de Gasto</span>
+              <h1 className="font-bold text-lg leading-none">
+                AhorroBot <span className="text-stone-400 font-normal">v2.1</span>
+              </h1>
+              <span className="text-[10px] text-stone-500 uppercase">
+                Motor de Optimización de Gasto
+              </span>
             </div>
+            <span
+              className={
+                'ml-2 px-2.5 py-1 rounded-full text-[10px] font-black uppercase ' +
+                (CONFIG.MODE === 'demo'
+                  ? 'bg-amber-100 text-amber-800'
+                  : 'bg-emerald-100 text-emerald-800')
+              }
+            >
+              {CONFIG.MODE === 'demo' ? 'Demo' : 'Producción'}
+            </span>
           </div>
-          <button onClick={restart} className="text-sm font-semibold text-stone-500 hover:text-stone-900 transition-colors">Reiniciar</button>
+          <button
+            type="button"
+            onClick={restart}
+            className="text-sm font-semibold text-stone-500 hover:text-stone-900"
+          >
+            Reiniciar
+          </button>
         </div>
       </header>
 
-      <main className="max-w-4xl mx-auto p-6 lg:p-12">
-        {/* Pasos Visuales */}
-        <div className="flex justify-between mb-16 relative">
-          <div className="absolute top-5 left-0 w-full h-[2px] bg-stone-200 -z-0"></div>
-          {[1, 2, 3, 4].map(n => (
-            <div key={n} className={`z-10 w-10 h-10 rounded-full flex items-center justify-center border-2 transition-all ${step >= n ? 'bg-stone-900 border-stone-900 text-white' : 'bg-white border-stone-200 text-stone-300'}`}>
-              {step > n ? <CheckCircle2 size={18} /> : <span className="text-xs font-bold">{n}</span>}
+      <main className="max-w-5xl mx-auto p-6 lg:p-12">
+        <div className="flex justify-between mb-10 relative">
+          <div className="absolute top-5 left-0 w-full h-[2px] bg-stone-200"></div>
+          {[1, 2, 3, 4].map(number => (
+            <div
+              key={number}
+              className={
+                'z-10 w-10 h-10 rounded-full flex items-center justify-center border-2 ' +
+                (step >= number
+                  ? 'bg-stone-900 border-stone-900 text-white'
+                  : 'bg-white border-stone-200 text-stone-300')
+              }
+            >
+              {step > number ? (
+                <CheckCircle2 size={18} />
+              ) : (
+                <span className="text-xs font-bold">{number}</span>
+              )}
             </div>
           ))}
         </div>
 
-        {/* FASE 1: UBICACIÓN */}
-        {step === 1 && (
-          <div className="bg-white rounded-2xl p-8 shadow-sm border border-stone-200 animate-in fade-in slide-in-from-bottom-2">
-            <h2 className="text-2xl font-bold mb-2">Validación de Cobertura</h2>
-            <p className="text-stone-500 mb-6">Defina el punto de origen para el cálculo de rutas y disponibilidad.</p>
-            <div className="flex gap-3">
-              <input 
-                type="text" 
-                placeholder="Código Postal (5 dígitos)" 
-                value={zipCode}
-                onChange={(e) => setZipCode(e.target.value.replace(/\D/g,''))}
-                maxLength={5}
-                className="flex-1 bg-stone-50 border border-stone-200 rounded-xl px-4 py-3 focus:ring-2 focus:ring-stone-900/10 outline-none transition-all font-mono"
-              />
-              <button 
-                onClick={handleSearchLocation}
-                disabled={isSearchingLoc}
-                className="bg-stone-900 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 hover:bg-stone-800 disabled:opacity-50"
-              >
-                {isSearchingLoc ? <Loader className="animate-spin" size={18} /> : <MapPin size={18} />}
-                Localizar
-              </button>
-            </div>
-            {locationError && <p className="mt-4 text-red-600 text-sm flex items-center gap-2 font-medium"><AlertTriangle size={14}/> {locationError}</p>}
+        {CONFIG.MODE === 'demo' && (
+          <div className="mb-8 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 flex gap-2">
+            <AlertTriangle size={18} className="shrink-0 mt-0.5" />
+            <span>
+              Modo demostración: ubicaciones, existencias y precios son simulados
+              y deterministas. No deben usarse para decidir una compra.
+            </span>
           </div>
         )}
 
-        {/* FASE 2: LISTA */}
+        {step === 1 && (
+          <section className="bg-white rounded-2xl p-8 shadow-sm border border-stone-200">
+            <h2 className="text-2xl font-bold mb-2">Validación de Cobertura</h2>
+            <p className="text-stone-500 mb-6">
+              Define el código postal desde el que se calculará la cobertura.
+            </p>
+            <form
+              className="flex flex-col sm:flex-row gap-3"
+              onSubmit={event => {
+                event.preventDefault();
+                findStores();
+              }}
+            >
+              <label htmlFor="postal-code" className="sr-only">Código postal</label>
+              <input
+                id="postal-code"
+                type="text"
+                inputMode="numeric"
+                autoComplete="postal-code"
+                placeholder="Código postal (5 dígitos)"
+                value={postalCode}
+                onChange={event =>
+                  setPostalCode(event.target.value.replace(/\D/g, '').slice(0, 5))
+                }
+                maxLength={5}
+                className="flex-1 bg-stone-50 border border-stone-200 rounded-xl px-4 py-3 outline-none font-mono"
+              />
+              <button
+                type="submit"
+                disabled={isFindingStores}
+                className="bg-stone-900 text-white px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2 disabled:opacity-50"
+              >
+                {isFindingStores ? (
+                  <Loader className="animate-spin" size={18} />
+                ) : (
+                  <MapPin size={18} />
+                )}
+                Localizar
+              </button>
+            </form>
+            {locationError && (
+              <p className="mt-4 text-red-600 text-sm flex items-center gap-2">
+                <AlertTriangle size={14} /> {locationError}
+              </p>
+            )}
+          </section>
+        )}
+
         {step === 2 && (
-          <div className="bg-white rounded-2xl p-8 shadow-sm border border-stone-200 animate-in fade-in">
-            <div className="flex justify-between items-center mb-6">
-              <h2 className="text-2xl font-bold">Configuración de Carrito</h2>
-              <span className="bg-green-100 text-green-700 px-3 py-1 rounded-full text-xs font-bold">{stores.length} Sucursales Activas</span>
+          <section className="bg-white rounded-2xl p-8 shadow-sm border border-stone-200">
+            <div className="flex flex-col sm:flex-row sm:justify-between gap-3 mb-5">
+              <h2 className="text-2xl font-bold">Configuración del Carrito</h2>
+              <span className="bg-green-100 text-green-700 px-3 py-1 rounded-full text-xs font-bold self-start">
+                {stores.length} sucursales verificadas
+              </span>
             </div>
-            
+
+            <div className="flex flex-wrap gap-2 mb-6">
+              {stores.map(store => (
+                <span
+                  key={store.id}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-stone-50 border border-stone-200 text-stone-600 text-xs rounded-full"
+                >
+                  <Store size={12} />
+                  {store.name} · {store.distanceKm.toFixed(1)} km
+                </span>
+              ))}
+            </div>
+
             <div className="mb-6">
-              <div className="flex justify-between items-center mb-2">
-                <label className="text-xs font-bold uppercase text-stone-400 tracking-widest">Entrada de Datos</label>
-                <button className="text-xs flex items-center gap-1 font-bold text-stone-600 hover:text-stone-900">
-                  <Mic size={14} /> Dictar vía NLP
+              <div className="flex flex-col sm:flex-row sm:justify-between gap-2 mb-2">
+                <div>
+                  <label
+                    htmlFor="shopping-list"
+                    className="text-xs font-bold uppercase text-stone-400"
+                  >
+                    Lista de compras
+                  </label>
+                  <p className="text-xs text-stone-500 mt-1">
+                    Producto | Marca | Cantidad | Presentación
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={structureList}
+                  disabled={isStructuring || !listText.trim()}
+                  className="text-xs flex items-center justify-center gap-1.5 font-bold border border-stone-200 rounded-lg px-3 py-2 disabled:opacity-50"
+                >
+                  {isStructuring ? (
+                    <Loader className="animate-spin" size={14} />
+                  ) : (
+                    <Bot size={14} />
+                  )}
+                  {CONFIG.MODE === 'demo'
+                    ? 'Normalizar lista'
+                    : 'Estructurar con IA'}
                 </button>
               </div>
-              <textarea 
-                className="w-full bg-stone-50 border border-stone-200 rounded-xl p-4 h-48 focus:ring-2 focus:ring-stone-900/10 outline-none font-mono text-sm"
-                placeholder="Producto | Marca | Cantidad"
-                value={listInput}
-                onChange={(e) => setListInput(e.target.value)}
+              <textarea
+                id="shopping-list"
+                className="w-full bg-stone-50 border border-stone-200 rounded-xl p-4 h-52 outline-none font-mono text-sm"
+                placeholder={'Leche | Lala | 2 | 1 L\nArroz | Verde Valle | 1 | 900 g'}
+                value={listText}
+                onChange={event => setListText(event.target.value)}
               />
             </div>
 
-            <button 
-              onClick={() => {
-                const items = listInput.split('\n').filter(l => l.includes('|')).map(line => {
-                  const [p, m, q] = line.split('|');
-                  return { product: p.trim(), brand: m.trim(), qty: parseInt(q) || 1 };
-                });
-                setParsedItems(items);
-                setStep(3);
-                startPriceSimulation(items);
-              }}
-              className="w-full bg-stone-900 text-white py-4 rounded-xl font-bold hover:bg-stone-800 transition-all flex items-center justify-center gap-2"
+            {listError && (
+              <p className="mb-4 text-red-600 text-sm flex items-center gap-2">
+                <AlertTriangle size={14} /> {listError}
+              </p>
+            )}
+
+            <button
+              type="button"
+              onClick={compare}
+              disabled={!listText.trim()}
+              className="w-full bg-stone-900 text-white py-4 rounded-xl font-bold disabled:opacity-50 flex items-center justify-center gap-2"
             >
               <ShoppingCart size={20} /> Ejecutar Comparativa
             </button>
-          </div>
+          </section>
         )}
 
-        {/* FASE 3: PROCESAMIENTO */}
         {step === 3 && (
-          <div className="text-center py-20 animate-pulse">
+          <section className="text-center py-20">
             <Loader size={48} className="mx-auto mb-6 animate-spin text-stone-300" />
-            <h2 className="text-xl font-bold">{processingMsg}</h2>
-          </div>
+            <h2 className="text-xl font-bold">{processingMessage}</h2>
+            <p className="text-stone-500 mt-2">
+              {items.length} artículos · {stores.length} sucursales
+            </p>
+          </section>
         )}
 
-        {/* FASE 4: RESULTADOS */}
         {step === 4 && results && (
-          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4">
-            <div className="bg-stone-900 text-white p-8 rounded-3xl relative overflow-hidden">
+          <section className="space-y-6">
+            <div
+              className={
+                'text-white p-8 rounded-3xl relative overflow-hidden ' +
+                (results.winner ? 'bg-stone-900' : 'bg-amber-700')
+              }
+            >
               <div className="relative z-10">
-                <p className="text-stone-400 text-xs font-bold uppercase mb-2">Opción más eficiente</p>
-                <h2 className="text-4xl font-black mb-4">{results.winner.name}</h2>
-                <div className="text-3xl font-mono text-white underline decoration-stone-500">
-                  Total: ${results.totals[results.winner.name].toFixed(2)}
-                </div>
+                <p className="text-white/70 text-xs font-bold uppercase mb-2">
+                  {results.winner
+                    ? 'Carrito completo más económico'
+                    : 'Comparación incompleta'}
+                </p>
+                <h2 className="text-3xl sm:text-4xl font-black mb-4">
+                  {results.winner
+                    ? results.winner.name
+                    : 'Ninguna sucursal cubre toda la lista'}
+                </h2>
+                {results.winner ? (
+                  <div className="text-3xl font-mono">
+                    Total: {'$'}{results.totals[results.winner.id].toFixed(2)}
+                  </div>
+                ) : (
+                  <p className="max-w-2xl text-white/90">
+                    Los totales parciales no se consideran ganadores. Revisa
+                    faltantes o define una política de sustituciones.
+                  </p>
+                )}
               </div>
-              <Store className="absolute right-[-20px] bottom-[-20px] w-48 h-48 opacity-10 rotate-12" />
+              <Store className="absolute right-[-20px] bottom-[-20px] w-48 h-48 opacity-10" />
+            </div>
+
+            <div className="flex flex-col sm:flex-row sm:justify-between gap-2 text-xs text-stone-500">
+              <span>
+                Fuente: {results.source === 'demo'
+                  ? 'simulación identificada'
+                  : results.source}
+              </span>
+              <span>
+                Actualización: {results.quotedAt
+                  ? new Date(results.quotedAt).toLocaleString('es-MX')
+                  : 'no informada'}
+              </span>
             </div>
 
             <div className="bg-white border border-stone-200 rounded-2xl overflow-hidden shadow-sm">
-              <table className="w-full text-left">
-                <thead className="bg-stone-50 border-b border-stone-200">
-                  <tr>
-                    <th className="p-4 text-xs font-bold text-stone-400 uppercase">Artículos</th>
-                    {stores.map(s => (
-                      <th key={s.name} className="p-4 text-xs font-bold text-stone-400 uppercase text-right">{s.name}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {results.table.map((row, idx) => (
-                    <tr key={idx} className="border-b border-stone-100 last:border-0">
-                      <td className="p-4">
-                        <p className="font-bold text-sm">{row.product}</p>
-                        <p className="text-[10px] text-stone-400 uppercase">{row.brand} x{row.qty}</p>
-                      </td>
-                      {stores.map(s => (
-                        <td key={s.name} className="p-4 text-right font-mono text-sm">
-                          {row.prices[s.name] ? `$${row.prices[s.name].subTotal.toFixed(2)}` : <span className="text-red-400 text-[10px]">Sin Stock</span>}
-                        </td>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left min-w-[720px]">
+                  <thead className="bg-stone-50 border-b border-stone-200">
+                    <tr>
+                      <th className="p-4 text-xs font-bold text-stone-400 uppercase">
+                        Artículos
+                      </th>
+                      {stores.map(store => (
+                        <th
+                          key={store.id}
+                          className="p-4 text-xs font-bold text-stone-400 uppercase text-right"
+                        >
+                          {store.name}
+                        </th>
                       ))}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {results.table.map(row => (
+                      <tr key={row.id} className="border-b border-stone-100">
+                        <td className="p-4">
+                          <p className="font-bold text-sm">{row.product}</p>
+                          <p className="text-[10px] text-stone-400 uppercase">
+                            {row.brand} · {row.presentation} · x{row.quantity}
+                          </p>
+                        </td>
+                        {stores.map(store => {
+                          const offer = row.prices[store.id];
+                          return (
+                            <td
+                              key={store.id}
+                              className="p-4 text-right font-mono text-sm"
+                            >
+                              {offer && offer.inStock ? (
+                                <div>
+                                  <span className="block font-bold">
+                                    {'$'}{offer.subtotal.toFixed(2)}
+                                  </span>
+                                  <span className="text-[10px] text-stone-400">
+                                    {'$'}{offer.unitPrice.toFixed(2)} c/u
+                                  </span>
+                                </div>
+                              ) : (
+                                <span className="text-red-500 text-[10px] font-bold">
+                                  No disponible
+                                </span>
+                              )}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                    <tr className="bg-stone-50 border-t-2 border-stone-200">
+                      <td className="p-4 text-right font-bold uppercase text-xs text-stone-500">
+                        Total y cobertura
+                      </td>
+                      {stores.map(store => {
+                        const summary = results.summaries.find(
+                          value => value.store.id === store.id
+                        );
+                        return (
+                          <td key={store.id} className="p-4 text-right">
+                            <span className="block font-bold text-lg">
+                              {'$'}{summary.total.toFixed(2)}
+                            </span>
+                            <span
+                              className={
+                                'text-[10px] font-bold ' +
+                                (summary.complete
+                                  ? 'text-green-700'
+                                  : 'text-amber-700')
+                              }
+                            >
+                              {summary.availableItems}/{results.table.length} artículos
+                            </span>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
-          </div>
+
+            <div className="flex flex-col sm:flex-row gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setStep(2);
+                  setResults(null);
+                }}
+                className="flex-1 py-3 bg-white border border-stone-200 rounded-xl font-bold"
+              >
+                Editar lista
+              </button>
+              <button
+                type="button"
+                onClick={restart}
+                className="flex-1 py-3 bg-stone-900 text-white rounded-xl font-bold"
+              >
+                Nueva búsqueda
+              </button>
+            </div>
+          </section>
         )}
       </main>
     </div>
   );
 }
+
